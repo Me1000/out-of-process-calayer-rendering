@@ -19,6 +19,7 @@
 #include <mach/mach.h>
 #include <servers/bootstrap.h>
 #include <dispatch/dispatch.h>
+#include "./message-structures.h"
 
 
 #define PORT_NAME "com.example.messageport"
@@ -30,14 +31,18 @@ void parentCallback(CFMachPortRef port, void *msg, CFIndex size, void *info);
 @property (strong, nonatomic) NSWindow *window;
 @property (strong, nonatomic) CALayer *rootLayer;
 @property (strong, nonatomic) CALayer *hostingLayer;
-@property (nonatomic) IOSurfaceRef surface;
-@property(nonatomic, strong) CADisplayLink *displayLink;
+@property (strong, nonatomic) NSMutableArray<id>* surfaces;
+@property (nonatomic) int currentSurfaceIndex;
+
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
 {
+    self.surfaces = [NSMutableArray arrayWithCapacity:2];
+    self.currentSurfaceIndex = 0;
+
     NSRect frame = NSMakeRect(100, 100, 300, 300);
     self.window = [[NSWindow alloc] initWithContentRect:frame
                                               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
@@ -66,36 +71,24 @@ void parentCallback(CFMachPortRef port, void *msg, CFIndex size, void *info);
 
     [self setupMachPort];
     [self spawnChildProcess];
-
-    self.displayLink = [[NSScreen mainScreen] displayLinkWithTarget:self selector:@selector(updateRender)];
-    [self.displayLink setPreferredFrameRateRange:CAFrameRateRangeMake(1,120, 120)];
-    [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-}
-
-- (void)displayLayer:(CALayer *)layer
-{
-    if (layer != self.hostingLayer || !self.surface) return;
-    // [CATransaction begin];
-    self.hostingLayer.contents = (__bridge id _Nullable)self.surface;
-    // [CATransaction commit];
 }
 
 - (id<CAAction>)actionForLayer:(CALayer *)theLayer
-                        forKey:(NSString *)theKey {
+                        forKey:(NSString *)theKey
+{
     return [NSNull null];
 }
 
-- (void)updateRender
+- (void)gotSurface:(IOSurfaceRef)surface forIndex:(int)index
 {
-    self.hostingLayer.contents = nil;//(__bridge id _Nullable)self.surface;
-    [self.hostingLayer setNeedsDisplay];
+    self.surfaces[index] = (__bridge id _Nullable)surface;
 }
 
-- (void)gotSurface:(IOSurfaceRef)surface
+- (void)updateToSurfaceIndex:(int)index
 {
-    self.surface = surface;
-    self.hostingLayer.contents = (__bridge id _Nullable)surface;
-    [self.hostingLayer setNeedsDisplay];
+    [CATransaction begin];
+    self.hostingLayer.contents = self.surfaces[index];
+    [CATransaction commit];
 }
 
 - (void)setupMachPort
@@ -158,16 +151,9 @@ int main(int, const char *[])
 
 void parentCallback(__unused CFMachPortRef port, void *msgData, __unused CFIndex size, void *info)
 {
-    // Define the message structure
-    typedef struct {
-        mach_msg_header_t header;
-        mach_msg_body_t body;
-        mach_msg_port_descriptor_t port_descriptor;
-    } MachMessage;
-    
     AppDelegate *appDelegate = (__bridge AppDelegate *)info;
     mach_msg_header_t *messageHeader = (mach_msg_header_t *)msgData;
-    
+
     NSLog(@"Received message:");
     NSLog(@"  msgh_bits: 0x%x", messageHeader->msgh_bits);
     NSLog(@"  msgh_size: %u", messageHeader->msgh_size);
@@ -175,39 +161,54 @@ void parentCallback(__unused CFMachPortRef port, void *msgData, __unused CFIndex
     NSLog(@"  msgh_local_port: %d", messageHeader->msgh_local_port);
     NSLog(@"  msgh_id: %d", messageHeader->msgh_id);
 
-    if (!(messageHeader->msgh_bits & MACH_MSGH_BITS_COMPLEX))
+    if (messageHeader->msgh_id == 1000)
     {
-        NSLog(@"Received message is not complex");
-        return;
-    }
-    MachMessage *message = (MachMessage *)msgData;
+        // handle setup message:
 
-    mach_msg_body_t *body = &message->body;
-    if (body->msgh_descriptor_count != 1)
+        if (!(messageHeader->msgh_bits & MACH_MSGH_BITS_COMPLEX))
+        {
+            NSLog(@"Received message is not complex");
+            return;
+        }
+        MachIOSurfaceSetupMessage *message = (MachIOSurfaceSetupMessage *)msgData;
+
+        mach_msg_body_t *body = &message->body;
+        if (body->msgh_descriptor_count != 2)
+        {
+            NSLog(@"Received message does not have `2` descriptor count as expected.");
+            return;
+        }
+
+        for (uint i = 0; i < body->msgh_descriptor_count; i++)
+        {
+            mach_msg_port_descriptor_t *portDescriptor = &message->port_descriptors[i];
+            mach_port_t receivedPort = portDescriptor->name;
+            NSLog(@"Received Mach port: %d", receivedPort);
+
+            IOSurfaceRef receivedSurface = IOSurfaceLookupFromMachPort(receivedPort);
+            if (receivedSurface)
+                [appDelegate gotSurface:receivedSurface forIndex:i];
+            else
+            {
+                NSLog(@"Failed to create IOSurface from received port");
+                mach_port_type_t type;
+                kern_return_t kr = mach_port_type(mach_task_self(), receivedPort, &type);
+                if (kr == KERN_SUCCESS)
+                    NSLog(@"Port type: %u", type);
+                    // MACH_PORT_TYPE_SEND should be set
+                else
+                    NSLog(@"Failed to get port type. Error: %d (%s)", kr, mach_error_string(kr));
+            }
+        }
+    }
+    else if (messageHeader->msgh_id == 2000)
     {
-        NSLog(@"Received message does not have `1` descriptor count as expected.");
-        return;
+        // update message
+        MachIOSurfaceSwapMessage *message = (MachIOSurfaceSwapMessage *)msgData;
+        [appDelegate updateToSurfaceIndex:message->surfaceIndex];
     }
 
-    mach_msg_port_descriptor_t *portDescriptor = &message->port_descriptor;
-    mach_port_t receivedPort = portDescriptor->name;
-
-    NSLog(@"Received Mach port: %d", receivedPort);
-
-    IOSurfaceRef receivedSurface = IOSurfaceLookupFromMachPort(receivedPort);
-    if (receivedSurface)
-        [appDelegate gotSurface:receivedSurface];
-    else
-    {
-        NSLog(@"Failed to create IOSurface from received port");
-        mach_port_type_t type;
-        kern_return_t kr = mach_port_type(mach_task_self(), receivedPort, &type);
-        if (kr == KERN_SUCCESS)
-            NSLog(@"Port type: %u", type);
-            // MACH_PORT_TYPE_SEND should be set
-        else
-            NSLog(@"Failed to get port type. Error: %d (%s)", kr, mach_error_string(kr));
-    }
+    
 
     // Clean up the received Mach port if you're done with it
     // mach_port_deallocate(mach_task_self(), receivedPort);
