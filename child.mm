@@ -5,6 +5,7 @@
 #include <sys/_types/_mach_port_t.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
+#import <Metal/Metal.h>
 
 #include <mach/mach.h>
 #include <servers/bootstrap.h>
@@ -36,12 +37,41 @@ static NSDictionary *optionsFor32BitSurface(CGSize size, unsigned pixelFormat)
         (id)kIOSurfaceElementHeight: @(1),
         (id)kIOSurfaceName: @"TestSurface"
     };
+}
 
+id<MTLTexture> textureFromSurface(IOSurfaceRef surface)
+{
+    // Create Metal texture descriptor
+    MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                                 width:IOSurfaceGetWidth(surface)
+                                                                                                height:IOSurfaceGetHeight(surface)
+                                                                                             mipmapped:NO];
+    textureDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    // Create Metal texture from IOSurface
+    id<MTLTexture> texture = [device newTextureWithDescriptor:textureDescriptor
+                                                   iosurface:surface
+                                                       plane:0];
+    
+    if (!texture)
+    {
+        NSLog(@"Failed to create Metal texture from IOSurface");
+        CFRelease(surface);
+        return nil;
+    }
+
+    // Release IOSurface (Metal texture retains it)
+    CFRelease(surface);
+    
+    return texture;
 }
 
 typedef struct
 {
+    CARenderer *renderer;
     IOSurfaceRef surfaces[2];
+    id<MTLTexture> textures[2];
     int totalBuffers;
     int nextSurfaceIndex;
     mach_port_t remotePort;
@@ -57,7 +87,13 @@ DoubleBuffer createDoubleBuffer(CGSize size, mach_port_t remotePort)
     NSDictionary *surfaceAttributes = optionsFor32BitSurface(size, 'BGRA');
     
     for (int i = 0; i < 2; i++)
-        buffer.surfaces[i] = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceAttributes);
+    {
+        IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceAttributes);
+        buffer.surfaces[i] = surface;
+        buffer.textures[i] = textureFromSurface(surface);
+    }
+    
+    buffer.renderer = [CARenderer rendererWithMTLTexture:buffer.textures[0] options:nil];
 
     return buffer;
 }
@@ -123,15 +159,15 @@ CALayer * debugView()
     // Make a layer tree and put it in a window so we can see what it looks like.
     CALayer *layer = makeLayers(CGSizeMake(300, 300));
     
-    NSRect frame = NSMakeRect(100, 500, 300, 300);
-    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
-        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
-        backing:NSBackingStoreBuffered
-        defer:NO];
-    window.title = @"Child";
-    [window makeKeyAndOrderFront:nil];
-    window.contentView.wantsLayer = YES;
-    window.contentView.layer = layer;
+    // NSRect frame = NSMakeRect(100, 500, 300, 300);
+    // NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+    //     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+    //     backing:NSBackingStoreBuffered
+    //     defer:NO];
+    // window.title = @"Child";
+    // [window makeKeyAndOrderFront:nil];
+    // window.contentView.wantsLayer = YES;
+    // window.contentView.layer = layer;
     
     return layer;
 }
@@ -157,50 +193,78 @@ void sendUpdatedSurfaceMessage(mach_port_t remotePort, int surfaceIndex)
         NSLog(@"Failed to send message: %s", mach_error_string(kr));
 }
 
+MTLRenderPassDescriptor * makeDescriptorForTexture(id<MTLTexture> texture)
+{
+    MTLRenderPassDescriptor *descriptor = [MTLRenderPassDescriptor new];
+
+    descriptor.colorAttachments[0].texture = texture;
+    descriptor.colorAttachments[0].loadAction = MTLLoadActionClear;    
+    
+    descriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+    
+    descriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+    
+    return descriptor;
+}
+
 void drawOnIOSurface(CALayer* layer, DoubleBuffer buffer) {
     // NSLog(@"drawing...");
     // Choose the next surface:
     const int surfaceIndex = buffer.nextSurfaceIndex;
-    IOSurfaceRef surface = buffer.surfaces[surfaceIndex];
-    buffer.nextSurfaceIndex = (surfaceIndex + 1) % buffer.totalBuffers;
+    // IOSurfaceRef surface = buffer.surfaces[surfaceIndex];
+    buffer.nextSurfaceIndex = 0;//(surfaceIndex + 1) % buffer.totalBuffers;
+    
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id queue = [device newCommandQueue];
+    id<MTLCommandBuffer> renderCommandBuffer = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> renderCommandEncoder = [renderCommandBuffer renderCommandEncoderWithDescriptor:makeDescriptorForTexture(buffer.textures[surfaceIndex])];
+    [renderCommandEncoder endEncoding];
+    [renderCommandBuffer commit];
+    [renderCommandBuffer waitUntilCompleted];
+    
+    [buffer.renderer beginFrameAtTime:CACurrentMediaTime() timeStamp: nil];
+    [buffer.renderer addUpdateRect:layer.bounds];
+    [buffer.renderer setDestination:buffer.textures[surfaceIndex]];
+    [buffer.renderer render];
+    [buffer.renderer endFrame];
     
     // Lock the IOSurface for writing
-    IOSurfaceLock(surface, kIOSurfaceLockAvoidSync, NULL);
-    size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
-    void *baseAddress = IOSurfaceGetBaseAddress(surface);
+    // IOSurfaceLock(surface, kIOSurfaceLockAvoidSync, NULL);
+    // size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+    // void *baseAddress = IOSurfaceGetBaseAddress(surface);
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef context = CGBitmapContextCreate(baseAddress,
-                                                 IOSurfaceGetWidth(surface),
-                                                 IOSurfaceGetHeight(surface),
-                                                 8,
-                                                 bytesPerRow,
-                                                 colorSpace,
-                                                 kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-    CGColorSpaceRelease(colorSpace);
+    // CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    // CGContextRef context = CGBitmapContextCreate(baseAddress,
+    //                                              IOSurfaceGetWidth(surface),
+    //                                              IOSurfaceGetHeight(surface),
+    //                                              8,
+    //                                              bytesPerRow,
+    //                                              colorSpace,
+    //                                              kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    // CGColorSpaceRelease(colorSpace);
 
-    if (!context)
-    {
-        NSLog(@"Failed to create CGBitmapContext");
-        IOSurfaceUnlock(surface, kIOSurfaceLockAvoidSync, NULL);
-        CFRelease(surface);
-        return;
-    }
+    // if (!context)
+    // {
+    //     NSLog(@"Failed to create CGBitmapContext");
+    //     IOSurfaceUnlock(surface, kIOSurfaceLockAvoidSync, NULL);
+    //     CFRelease(surface);
+    //     return;
+    // }
 
-    CGContextSaveGState(context);
-    // CGContextTranslateCTM(context, 0, layer.bounds.size.height);
-    // CGContextScaleCTM(context, 1.0, -1.0);
-    CGContextScaleCTM(context, 2.0, 2.0);
-    // FIXME: -renderInContext: is not fully supported, but the documentation
-    // is (predictibly) not super helpful in what's not supported. Using a
-    // CARenderer is probably the "correct" way to do this, but this is sufficient
-    // for the purposes of this POC.
-    [layer.presentationLayer renderInContext:context];
-    CGContextRestoreGState(context);
+    // CGContextSaveGState(context);
+    // // CGContextTranslateCTM(context, 0, layer.bounds.size.height);
+    // // CGContextScaleCTM(context, 1.0, -1.0);
+    // CGContextScaleCTM(context, 2.0, 2.0);
+    // // FIXME: -renderInContext: is not fully supported, but the documentation
+    // // is (predictibly) not super helpful in what's not supported. Using a
+    // // CARenderer is probably the "correct" way to do this, but this is sufficient
+    // // for the purposes of this POC.
+    // [layer renderInContext:context];
+    // CGContextRestoreGState(context);
 
-    // Clean up
-    CGContextRelease(context);
-    IOSurfaceUnlock(surface, kIOSurfaceLockAvoidSync, NULL);
+    // // Clean up
+    // CGContextRelease(context);
+    // IOSurfaceUnlock(surface, kIOSurfaceLockAvoidSync, NULL);
 
     sendUpdatedSurfaceMessage(buffer.remotePort, surfaceIndex);
     
@@ -268,6 +332,7 @@ int main(int, const char *[])
         NSLog(@"Sent port right successfully");
 
         CALayer *layer = debugView();
+        buffer.renderer.layer = layer;
         drawOnIOSurface(layer, buffer);
 
         CFRunLoopRun();
